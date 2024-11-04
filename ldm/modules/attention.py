@@ -82,12 +82,14 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
-def zero_module(module):
+def zero_module(module: nn.Module) -> nn.Module:
     """
     Zero out the parameters of a module and return it.
     """
+
     for p in module.parameters():
         p.detach().zero_()
+
     return module
 
 
@@ -120,7 +122,8 @@ class LinearAttention(nn.Module):
         return self.to_out(out)
 
 
-class SpatialSelfAttention(nn.Module):
+# 没有使用过:
+class _SpatialSelfAttention(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
         self.in_channels = in_channels
@@ -295,11 +298,18 @@ class SpatialTransformer(nn.Module):
     """
 
     def __init__(
-        self, in_channels, n_heads, d_head, depth=1, dropout=0.0, context_dim=None
+        self,
+        in_channels: int,
+        number_of_heads: int,
+        head_dim: int,
+        depth: int = 1,
+        dropout: float = 0.0,
+        context_dim: Optional[int] = None,
     ):
         super().__init__()
+
         self.in_channels = in_channels
-        inner_dim = n_heads * d_head
+        inner_dim = number_of_heads * head_dim
         self.norm = Normalize(in_channels)
 
         self.proj_in = nn.Conv2d(
@@ -309,9 +319,13 @@ class SpatialTransformer(nn.Module):
         self.transformer_blocks = nn.ModuleList(
             [
                 BasicTransformerBlock(
-                    inner_dim, n_heads, d_head, dropout=dropout, context_dim=context_dim
+                    inner_dim,
+                    number_of_heads,
+                    head_dim,
+                    dropout=dropout,
+                    context_dim=context_dim,
                 )
-                for d in range(depth)
+                for _ in range(depth)
             ]
         )
 
@@ -321,13 +335,23 @@ class SpatialTransformer(nn.Module):
 
     def forward(self, x, context=None):
         # note: if no context is given, cross-attention defaults to self-attention
+
         b, c, h, w = x.shape
+
         x_in = x
+
         x = self.norm(x)
         x = self.proj_in(x)
+
         x = rearrange(x, "b c h w -> b (h w) c")
+
         for block in self.transformer_blocks:
             x = block(x, context=context)
+
+        # 此时 x 富含其自身以及文本嵌入的语义
+
         x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
-        x = self.proj_out(x)
-        return x + x_in
+
+        x = self.proj_out(x)  # 一开始为零
+
+        return x + x_in  # residual 连接

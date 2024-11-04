@@ -93,7 +93,7 @@ def zero_module(module: nn.Module) -> nn.Module:
     return module
 
 
-def Normalize(in_channels):
+def get_group_norm(in_channels) -> torch.nn.GroupNorm:
     return torch.nn.GroupNorm(
         num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
     )
@@ -128,7 +128,7 @@ class _SpatialSelfAttention(nn.Module):
         super().__init__()
         self.in_channels = in_channels
 
-        self.norm = Normalize(in_channels)
+        self.norm = get_group_norm(in_channels)
         self.q = torch.nn.Conv2d(
             in_channels, in_channels, kernel_size=1, stride=1, padding=0
         )
@@ -176,7 +176,7 @@ class CrossAttention(nn.Module):
         context_dim: Optional[int] = None,
         number_of_heads: int = 8,
         head_dim: int = 64,
-        dropout: float = 0.0,
+        dropout_strength: float = 0.0,
     ):
         super().__init__()
 
@@ -186,12 +186,13 @@ class CrossAttention(nn.Module):
         self.scale = head_dim**-0.5
         self.number_of_heads = number_of_heads
 
+        # 同时为所有 number_of_heads 个注意力头分配矩阵:
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
         self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
 
         self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, query_dim), nn.Dropout(dropout)
+            nn.Linear(inner_dim, query_dim), nn.Dropout(dropout_strength)
         )
 
     def forward(
@@ -203,30 +204,35 @@ class CrossAttention(nn.Module):
         # 如果不给出上下文 embedding, 那么 cross-attention 就退化为 self-attention:
         context_tensor = get_default_if_not_exists(context_tensor, x)
 
-        h = self.number_of_heads
-
-        q = self.to_q(x)  # b n l -> b n (h d)
-        k = self.to_k(context_tensor)  # b n t -> b n (h d)
-        v = self.to_v(context_tensor)  # b n t -> b n (h d)
+        q = self.to_q(x)  # b n1 d1 -> b n1 (h d)
+        k = self.to_k(context_tensor)  # b n2 d2 -> b n2 (h d)
+        v = self.to_v(context_tensor)  # b n2 d2 -> b n2 (h d)
 
         q, k, v = map(
-            lambda tensor: rearrange(tensor, "b n (h d) -> (b h) n d", h=h), (q, k, v)
+            lambda tensor: rearrange(
+                tensor, "b n (h d) -> (b h) n d", h=self.number_of_heads
+            ),
+            (q, k, v),
         )
 
+        # Q 和 K 做点积得到注意力系数:
         attention = einsum("b i d, b j d -> b i j", q, k) * self.scale
 
         if mask is not None:
             mask = rearrange(mask, "b ... -> b (...)")
-            mask = repeat(mask, "b j -> (b h) () j", h=h)
+            mask = repeat(mask, "b j -> (b h) () j", h=self.number_of_heads)
             max_negative_value = -torch.finfo(attention.dtype).max
             attention.masked_fill_(~mask, max_negative_value)  # type: ignore
 
         # attention, what we cannot get enough of
         attention = attention.softmax(dim=-1)
 
+        # 对 V 进行加权求和:
         out = einsum("b i j, b j d -> b i d", attention, v)
-        out = rearrange(out, "(b h) n d -> b n (h d)", h=h)
-        out = self.to_out(out)  # b n (h d) -> b n l
+
+        # 恢复与输入相同的形状:
+        out = rearrange(out, "(b h) n d -> b n (h d)", h=self.number_of_heads)
+        out = self.to_out(out)  # b n1 (h d) -> b n1 d1
 
         return out
 
@@ -237,53 +243,63 @@ class BasicTransformerBlock(nn.Module):
         dim: int,
         number_of_heads: int,
         head_dim: int,
-        dropout: float = 0.0,
+        dropout_strength: float = 0.0,
         context_dim: Optional[int] = None,
         gated_ff=True,
-        checkpoint: bool = True,
+        need_generate_checkpoint: bool = True,
     ):
         super().__init__()
 
-        self.attn1 = CrossAttention(
+        self.attention_1 = CrossAttention(
             query_dim=dim,
             number_of_heads=number_of_heads,
             head_dim=head_dim,
-            dropout=dropout,
+            dropout_strength=dropout_strength,
         )  # is a self-attention
 
-        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
+        self.feed_forward = FeedForward(dim, dropout=dropout_strength, glu=gated_ff)
 
-        self.attn2 = CrossAttention(
+        self.attention_2 = CrossAttention(
             query_dim=dim,
             context_dim=context_dim,
             number_of_heads=number_of_heads,
             head_dim=head_dim,
-            dropout=dropout,
-        )  # is self-attn if context is none
+            dropout_strength=dropout_strength,
+        )  # is self-attention if context is none
 
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.norm3 = nn.LayerNorm(dim)
+        self.layer_norm_1 = nn.LayerNorm(dim)
+        self.layer_norm_2 = nn.LayerNorm(dim)
+        self.layer_norm_3 = nn.LayerNorm(dim)
 
-        self.checkpoint = checkpoint
+        self.need_generate_checkpoint = need_generate_checkpoint
 
     def forward(
         self,
         x: torch.Tensor,
-        context: Optional[torch.Tensor] = None,
+        context_tensor: Optional[torch.Tensor] = None,
     ):
         return checkpoint(
-            self._forward, (x, context), self.parameters(), self.checkpoint
+            self._forward,
+            (x, context_tensor),
+            self.parameters(),
+            self.need_generate_checkpoint,
         )
 
     def _forward(
         self,
         x: torch.Tensor,
-        context: Optional[torch.Tensor] = None,
+        context_tensor: Optional[torch.Tensor] = None,
     ):
-        x = self.attn1(self.norm1(x)) + x
-        x = self.attn2(self.norm2(x), context=context) + x
-        x = self.ff(self.norm3(x)) + x
+        """将传入的图像嵌入 x 与上下文 (文本) 嵌入进行 cross-attention"""
+
+        # 先自注意力 + residual 连接:
+        x = self.attention_1(self.layer_norm_1(x)) + x
+
+        # 再交叉注意力 + residual 连接:
+        x = self.attention_2(self.layer_norm_2(x), context_tensor=context_tensor) + x
+
+        # 最后进行自由组合 + residual 连接:
+        x = self.feed_forward(self.layer_norm_3(x)) + x
 
         return x
 
@@ -302,7 +318,7 @@ class SpatialTransformer(nn.Module):
         in_channels: int,
         number_of_heads: int,
         head_dim: int,
-        depth: int = 1,
+        attention_depth: int = 1,
         dropout: float = 0.0,
         context_dim: Optional[int] = None,
     ):
@@ -310,9 +326,9 @@ class SpatialTransformer(nn.Module):
 
         self.in_channels = in_channels
         inner_dim = number_of_heads * head_dim
-        self.norm = Normalize(in_channels)
+        self.group_norm = get_group_norm(in_channels)
 
-        self.proj_in = nn.Conv2d(
+        self.projection_in = nn.Conv2d(
             in_channels, inner_dim, kernel_size=1, stride=1, padding=0
         )
 
@@ -322,26 +338,28 @@ class SpatialTransformer(nn.Module):
                     inner_dim,
                     number_of_heads,
                     head_dim,
-                    dropout=dropout,
+                    dropout_strength=dropout,
                     context_dim=context_dim,
                 )
-                for _ in range(depth)
+                for _ in range(attention_depth)
             ]
         )
 
-        self.proj_out = zero_module(
+        self.projection_out = zero_module(
             nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
         )
 
     def forward(self, x, context=None):
         # note: if no context is given, cross-attention defaults to self-attention
 
-        b, c, h, w = x.shape
+        _, _, h, w = x.shape
 
-        x_in = x
+        x_copy = x
 
-        x = self.norm(x)
-        x = self.proj_in(x)
+        x = self.group_norm(x)
+
+        # 对图像进行嵌入:
+        x = self.projection_in(x)
 
         x = rearrange(x, "b c h w -> b (h w) c")
 
@@ -352,6 +370,6 @@ class SpatialTransformer(nn.Module):
 
         x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
 
-        x = self.proj_out(x)  # 一开始为零
+        x = self.projection_out(x)  # 一开始为零
 
-        return x + x_in  # residual 连接
+        return x + x_copy  # residual 连接

@@ -122,7 +122,7 @@ class AttentionPool2d(nn.Module):
         x = self.attention(x)
         x = self.c_proj(x)
 
-        return x[:, :, 0]
+        return x[:, :, 0]  # 仅返回第一个 feature
 
 
 class TimestepBlock(nn.Module):

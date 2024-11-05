@@ -30,7 +30,50 @@ def convert_module_to_f32(x):
     pass
 
 
-## go
+class QKVAttention(nn.Module):
+    """
+    A module which performs QKV attention and splits in a different order.
+    """
+
+    def __init__(self, number_of_heads: int):
+        super().__init__()
+
+        self.number_of_heads = number_of_heads
+
+    def forward(self, qkv: th.Tensor):
+        """
+        Apply QKV attention.
+        :param qkv: an [N x (3 * H * C) x T] tensor of Qs, Ks, and Vs.
+        :return: an [N x (H * C) x T] tensor after attention.
+        """
+
+        # width = 3 * embed_dim = 3 * head_dim * number_of_heads
+        batch_size, width, feature_map_length = qkv.shape
+        assert width % (3 * self.number_of_heads) == 0
+        ch = width // (3 * self.number_of_heads)  # ch == head_dim
+        q, k, v = qkv.chunk(3, dim=1)
+        scale = 1 / math.sqrt(
+            math.sqrt(ch)
+        )  # 两次开方是为了下面 f16 精度的浮点计算的稳定性
+        weight = th.einsum(
+            "bct,bcs->bts",
+            (q * scale).view(batch_size * self.number_of_heads, ch, feature_map_length),
+            (k * scale).view(batch_size * self.number_of_heads, ch, feature_map_length),
+        )  # More stable with f16 than dividing afterwards
+        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+        out = th.einsum(
+            "bts,bcs->bct",
+            weight,
+            v.reshape(batch_size * self.number_of_heads, ch, feature_map_length),
+        )
+        out = out.reshape(batch_size, -1, feature_map_length)
+        return out
+
+    @staticmethod
+    def count_flops(model, _x, y):
+        return count_flops_attn(model, _x, y)
+
+
 class AttentionPool2d(nn.Module):
     """
     Adapted from CLIP: https://github.com/openai/CLIP/blob/main/clip/model.py
@@ -40,26 +83,41 @@ class AttentionPool2d(nn.Module):
         self,
         spacial_dim: int,
         embed_dim: int,
-        num_heads_channels: int,
+        head_dim: int,
         output_dim: Optional[int] = None,
     ):
         super().__init__()
 
         # self.positional_embedding = nn.Parameter(th.randn(embed_dim, spacial_dim ** 2 + 1) / embed_dim ** 0.5)
+
+        # 随机初始化 spacial_dim**2 + 1 个不同的位置嵌入, 每个位置嵌入的维度为 embed_dim:
         self.positional_embedding = Parameter(
             th.randn(embed_dim, spacial_dim**2 + 1) / embed_dim**0.5
-        )
-        self.qkv_proj = conv_nd(1, embed_dim, 3 * embed_dim, 1)
+        )  # 这里假设图像是方形的, 因此是 spacial_dim**2
+        self.qkv_proj = conv_nd(1, embed_dim, 3 * embed_dim, 1)  # 横着拼接
+        self.number_of_heads = (
+            embed_dim // head_dim
+        )  # embed_dim = head_dim * number_of_heads
+        self.attention = QKVAttention(self.number_of_heads)
         self.c_proj = conv_nd(1, embed_dim, output_dim or embed_dim, 1)
-        self.num_heads = embed_dim // num_heads_channels
-        self.attention = QKVAttention(self.num_heads)
 
     def forward(self, x):
-        # b, c, *_spatial = x.shape
-        b, c, *_ = x.shape
-        x = x.reshape(b, c, -1)  # NC(HW)
-        x = th.cat([x.mean(dim=-1, keepdim=True), x], dim=-1)  # NC(HW+1)
-        x = x + self.positional_embedding[None, :, :].to(x.dtype)  # NC(HW+1)
+        b, c, *_spatial = x.shape
+        # 此处:
+        # - len(_spatial) == 2
+        # - _spatial[0] == _spatial[1]
+        # - c == head_dim
+
+        # 将二维图像摊平成一维向量:
+        x = x.reshape(b, c, -1)  # N C (H W)
+
+        # 将每个特征 channel 的均值构成的一个切面添加到**开头**:
+        x = th.cat([x.mean(dim=-1, keepdim=True), x], dim=-1)  # N C (H W + 1)
+
+        # 将位置嵌入沿坐标轴 N 进行广播 (位置嵌入是随机初始化并且是可学习的):
+        x = x + self.positional_embedding[None, :, :].to(x.dtype)  # N C (H W + 1)
+
+        # 多头注意力机制 (没有 residual 连接):
         x = self.qkv_proj(x)
         x = self.attention(x)
         x = self.c_proj(x)
@@ -396,40 +454,6 @@ class QKVAttentionLegacy(nn.Module):
         )  # More stable with f16 than dividing afterwards
         weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
         a = th.einsum("bts,bcs->bct", weight, v)
-        return a.reshape(bs, -1, length)
-
-    @staticmethod
-    def count_flops(model, _x, y):
-        return count_flops_attn(model, _x, y)
-
-
-class QKVAttention(nn.Module):
-    """
-    A module which performs QKV attention and splits in a different order.
-    """
-
-    def __init__(self, n_heads):
-        super().__init__()
-        self.n_heads = n_heads
-
-    def forward(self, qkv):
-        """
-        Apply QKV attention.
-        :param qkv: an [N x (3 * H * C) x T] tensor of Qs, Ks, and Vs.
-        :return: an [N x (H * C) x T] tensor after attention.
-        """
-        bs, width, length = qkv.shape
-        assert width % (3 * self.n_heads) == 0
-        ch = width // (3 * self.n_heads)
-        q, k, v = qkv.chunk(3, dim=1)
-        scale = 1 / math.sqrt(math.sqrt(ch))
-        weight = th.einsum(
-            "bct,bcs->bts",
-            (q * scale).view(bs * self.n_heads, ch, length),
-            (k * scale).view(bs * self.n_heads, ch, length),
-        )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
-        a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
         return a.reshape(bs, -1, length)
 
     @staticmethod

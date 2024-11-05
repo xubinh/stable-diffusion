@@ -245,7 +245,7 @@ class DDPM(pl.LightningModule):
             )
         else:
             raise NotImplementedError("mu not supported")
-        
+
         # TODO how to choose this term
         lvlb_weights[0] = lvlb_weights[1]
         self.register_buffer("lvlb_weights", lvlb_weights, persistent=False)  # type: ignore
@@ -1948,8 +1948,10 @@ class LatentDiffusion(DDPM):
 class DiffusionWrapper(pl.LightningModule):
     def __init__(self, diff_model_config, conditioning_key):
         super().__init__()
+
         self.diffusion_model = instantiate_from_config(diff_model_config)
         self.conditioning_key = conditioning_key
+
         assert self.conditioning_key in [None, "concat", "crossattn", "hybrid", "adm"]
 
     def forward(

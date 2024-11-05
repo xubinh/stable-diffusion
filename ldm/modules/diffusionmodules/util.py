@@ -21,7 +21,7 @@ from ldm.util import instantiate_from_config
 
 def make_beta_schedule(
     schedule, n_timestep, linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3
-):
+) -> np.ndarray:
     if schedule == "linear":
         betas = (
             torch.linspace(
@@ -38,7 +38,7 @@ def make_beta_schedule(
         alphas = torch.cos(alphas).pow(2)
         alphas = alphas / alphas[0]
         betas = 1 - alphas[1:] / alphas[:-1]
-        betas = np.clip(betas, a_min=0, a_max=0.999)
+        betas = np.clip(betas, a_min=0, a_max=0.999)  # 此处 betas 的类型是 torch.Tensor
 
     elif schedule == "sqrt_linear":
         betas = torch.linspace(
@@ -51,8 +51,6 @@ def make_beta_schedule(
         )
     else:
         raise ValueError(f"schedule '{schedule}' unknown.")
-
-    # assert isinstance(betas, torch.Tensor)
 
     return betas.numpy()  # type: ignore
 
